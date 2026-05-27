@@ -1080,14 +1080,6 @@ if (new Date().getDay() === 5) {
 }
 
 // 心跳：每5秒通知服务端浏览器还开着，20秒无心跳服务端自动退出
-setInterval(() => {
-  fetch('/api/heartbeat').catch(() => {});
-}, 5000);
-
-// 关闭页面时立即通知服务端停止
-window.addEventListener('beforeunload', () => {
-  fetch('/api/shutdown', { method: 'POST', keepalive: true }).catch(() => {});
-});
 </script>
 </body>
 </html>

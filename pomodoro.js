@@ -153,13 +153,6 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 
-let lastHeartbeat = Date.now();
-setInterval(() => {
-  if (Date.now() - lastHeartbeat > 20000) {
-    console.log('浏览器已关闭，自动停止服务');
-    process.exit(0);
-  }
-}, 10000);
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -262,21 +255,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // API: Heartbeat (浏览器存活信号)
-  if (url.pathname === '/api/heartbeat' && req.method === 'GET') {
-    lastHeartbeat = Date.now();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true }));
-  }
-
-  // API: Shutdown (关闭浏览器时停止服务)
-  if (url.pathname === '/api/shutdown' && req.method === 'POST') {
-    console.log('收到关闭请求，1秒后停止服务...');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
-    setTimeout(() => process.exit(0), 1000);
-    return;
-  }
 
   // Serve static files
   let filePath = path.join(PUBLIC_DIR, url.pathname === '/' ? 'pomodoro.html' : url.pathname);
