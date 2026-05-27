@@ -552,15 +552,15 @@ function saveState() {
     currentTaskIndex: state.currentTaskIndex,
     tasks
   };
-  // 服务端保存（自动静默降级到 localStorage）
+  // 始终保存到 localStorage（无论是否连上服务器都可靠）
+  localStorage.setItem('pomodoro-state', JSON.stringify(data));
+  // 额外同步到服务端（静默降级，用于周报等功能）
   fetch('/api/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
     keepalive: true,
-  }).catch(() => {
-    localStorage.setItem('pomodoro-state', JSON.stringify(data));
-  });
+  }).catch(() => {});
 }
 
 function applyLoadedState(saved) {
@@ -581,19 +581,23 @@ function applyLoadedState(saved) {
 }
 
 async function loadState() {
-  // 优先从服务端加载
+  // 优先从 localStorage 加载（无论是否连上服务器都可靠）
+  try {
+    const saved = JSON.parse(localStorage.getItem('pomodoro-state'));
+    if (saved) {
+      applyLoadedState(saved);
+      return;
+    }
+  } catch(e) {}
+  // 降级到服务端（首次使用或 localStorage 被清的情况）
   try {
     const res = await fetch('/api/load');
     if (res.ok) {
       const saved = await res.json();
       applyLoadedState(saved);
-      return;
+      // 同步到 localStorage，后续直接从本地加载
+      localStorage.setItem('pomodoro-state', JSON.stringify(saved));
     }
-  } catch(e) {}
-  // 降级到 localStorage
-  try {
-    const saved = JSON.parse(localStorage.getItem('pomodoro-state'));
-    if (saved) applyLoadedState(saved);
   } catch(e) {}
 }
 
