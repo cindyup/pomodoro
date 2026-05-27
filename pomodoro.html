@@ -228,6 +228,7 @@
     <div class="stat"><div class="stat-value" id="sessionCount">0</div><div class="stat-label">当前轮次</div></div>
     <div class="stat"><div class="stat-value" id="totalFocusTime">0m</div><div class="stat-label">总专注时间</div></div>
   </div>
+  <div style="text-align:center;margin-top:6px"><span id="restoreBtn" style="font-size:11px;color:#555;cursor:pointer" title="从服务端恢复数据（将替换当前数据）">从服务器恢复</span></div>
 </div>
 
   <!-- 周报 -->
@@ -271,6 +272,9 @@ const MODES = {
 };
 
 const CIRCUMFERENCE = 2 * Math.PI * 115;
+const SESSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+let _fullData = null;      // 服务端全量数据（含历史 session）
+let _fullDataReady = false; // _fullData 是否已加载完成
 
 let state = {
   mode: 'pomodoro',
@@ -280,6 +284,7 @@ let state = {
   completed: 0,
   sessionInRound: 0,
   currentTaskIndex: -1,
+  sessionDuration: MODES.pomodoro.duration, // 当前轮次开始时的总时长（锁定值，不受 setting 变更影响）
 };
 
 const $ = id => document.getElementById(id);
@@ -349,6 +354,7 @@ function showNotification(msg) {
     osc.frequency.value = 880; osc.type = 'sine';
     gain.gain.value = 0.3;
     osc.start(); osc.stop(ctx.currentTime + 0.3);
+    osc.onended = () => ctx.close();
   } catch(e) {}
 }
 
@@ -404,6 +410,7 @@ function toggleTimer() {
     state.running = false;
     mainBtn.textContent = '继续';
   } else {
+    state.sessionDuration = getDurations()[state.mode];
     state.timerId = setInterval(tick, 1000);
     state.running = true;
     mainBtn.textContent = '暂停';
@@ -468,9 +475,8 @@ function recordSession() {
   if (state.currentTaskIndex >= 0 && state.currentTaskIndex < items.length) {
     const li = items[state.currentTaskIndex];
     const sessions = JSON.parse(li.dataset.sessions || '[]');
-    const d = getDurations();
-    const elapsed = d.pomodoro - Math.max(0, state.timeLeft);
-    sessions.push({ timestamp: Date.now(), duration: elapsed });
+    const elapsed = state.sessionDuration - Math.max(0, state.timeLeft);
+    sessions.push({ timestamp: Date.now(), duration: Math.max(elapsed, 1) });
     li.dataset.sessions = JSON.stringify(sessions);
     renderTaskBadge(li);
   }
@@ -525,7 +531,7 @@ function createTaskElement(text, done, sessions, createdAt, category) {
   li.addEventListener('click', e => {
     if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
     selectTask(Array.from(taskList.children).indexOf(li));
-    if (!state.running && state.mode === 'pomodoro') toggleTimer();
+    if (!state.running && state.mode === 'pomodoro' && !li.classList.contains('done')) toggleTimer();
   });
   renderTaskBadge(li);
   return li;
@@ -552,28 +558,73 @@ function saveState() {
     completed: state.completed,
     sessionInRound: state.sessionInRound,
     currentTaskIndex: state.currentTaskIndex,
+    mode: state.mode,
+    timeLeft: state.timeLeft,
     tasks
   };
-  // 始终保存到 localStorage（无论是否连上服务器都可靠）
-  localStorage.setItem('pomodoro-state', JSON.stringify(data));
-  // 额外同步到服务端（静默降级，用于周报等功能）
-  fetch('/api/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-    keepalive: true,
-  }).catch(() => {});
+  // localStorage: 只保留 30 天窗口，提升日常读写性能
+  const localData = JSON.parse(JSON.stringify(data));
+  const cutoff = Date.now() - SESSION_RETENTION_MS;
+  localData.tasks.forEach(t => {
+    t.sessions = (t.sessions || []).filter(s => s.timestamp >= cutoff);
+  });
+  localStorage.setItem('pomodoro-state', JSON.stringify(localData));
+  // 服务端: 合并全量数据后保存（不影响日常 30 天窗口性能）
+  if (_fullDataReady && _fullData) {
+    mergeIntoFullData(data);
+    fetch('/api/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_fullData),
+      keepalive: true,
+    }).catch(() => {});
+  }
+  // _fullData 加载完成前不写服务端，避免覆盖全量历史
 }
 
-function applyLoadedState(saved) {
+function mergeIntoFullData(currentData) {
+  _fullData.completed = currentData.completed;
+  _fullData.sessionInRound = currentData.sessionInRound;
+  _fullData.currentTaskIndex = currentData.currentTaskIndex;
+  _fullData.mode = currentData.mode;
+  _fullData.timeLeft = currentData.timeLeft;
+  const domCreatedAts = new Set(currentData.tasks.map(t => t.createdAt));
+  currentData.tasks.forEach(t => {
+    const existing = _fullData.tasks.find(ft => ft.createdAt === t.createdAt);
+    if (existing) {
+      const existingTs = new Set(existing.sessions.map(s => s.timestamp));
+      t.sessions.forEach(s => {
+        if (!existingTs.has(s.timestamp)) existing.sessions.push(s);
+      });
+      existing.done = t.done;
+      existing.category = t.category || existing.category;
+      if (t.completedAt) existing.completedAt = t.completedAt;
+    } else {
+      _fullData.tasks.push(t);
+    }
+  });
+  // 只保留已完成任务 + 仍在 DOM 中的任务（已删除的未完成任务不保留）
+  _fullData.tasks = _fullData.tasks.filter(t => t.done || domCreatedAts.has(t.createdAt));
+}
+
+function applyLoadedState(saved, keepAllSessions) {
   state.completed = saved.completed || 0;
   state.sessionInRound = saved.sessionInRound || 0;
   state.currentTaskIndex = saved.currentTaskIndex != null ? saved.currentTaskIndex : -1;
+  if (saved.mode && MODES[saved.mode]) state.mode = saved.mode;
+  if (saved.timeLeft != null) state.timeLeft = saved.timeLeft;
   completedCount.textContent = state.completed;
   sessionCount.textContent = state.sessionInRound;
   (saved.tasks || []).forEach(t => {
-    const sessions = t.sessions || [];
-    const li = createTaskElement(t.text, t.done, sessions, t.createdAt || Date.now(), t.category);
+    let sessions = t.sessions || [];
+    if (!keepAllSessions) {
+      const cutoff = Date.now() - SESSION_RETENTION_MS;
+      sessions = sessions.filter(s => s.timestamp >= cutoff);
+    }
+    // 如果没有 createdAt，用最早 session 时间作为回退，确保周报能找到
+    const fallbackCreatedAt = t.createdAt
+      || (sessions.length > 0 ? Math.min(...sessions.map(s => s.timestamp)) : Date.now());
+    const li = createTaskElement(t.text, t.done, sessions, fallbackCreatedAt, t.category);
     if (t.completedAt) li.dataset.completedAt = t.completedAt;
     taskList.appendChild(li);
   });
@@ -583,11 +634,12 @@ function applyLoadedState(saved) {
 }
 
 async function loadState() {
-  // 优先从 localStorage 加载（无论是否连上服务器都可靠）
+  // 优先从 localStorage 加载 30 天窗口（即时可用）
   try {
     const saved = JSON.parse(localStorage.getItem('pomodoro-state'));
     if (saved) {
-      applyLoadedState(saved);
+      applyLoadedState(saved, false);
+      loadFullDataFromServer(); // 后台加载全量数据，后续 saveState 时合并
       return;
     }
   } catch(e) {}
@@ -596,11 +648,28 @@ async function loadState() {
     const res = await fetch('/api/load');
     if (res.ok) {
       const saved = await res.json();
-      applyLoadedState(saved);
-      // 同步到 localStorage，后续直接从本地加载
+      _fullData = saved;
+      _fullDataReady = true;
+      applyLoadedState(saved, false);
       localStorage.setItem('pomodoro-state', JSON.stringify(saved));
     }
   } catch(e) {}
+}
+
+async function loadFullDataFromServer() {
+  try {
+    const res = await fetch('/api/load');
+    if (res.ok) {
+      _fullData = await res.json();
+      _fullDataReady = true;
+    } else if (res.status === 404) {
+      // 服务端无数据，标记就绪以便后续写入
+      _fullData = { completed: 0, sessionInRound: 0, currentTaskIndex: -1, tasks: [] };
+      _fullDataReady = true;
+    }
+  } catch(e) {
+    // 服务端不可达，_fullDataReady 保持 false
+  }
 }
 
 document.querySelectorAll('.mode-tab').forEach(tab => {
@@ -612,6 +681,37 @@ finishBtn.addEventListener('click', () => {
   completePomodoro();
 });
 resetBtn.addEventListener('click', resetTimer);
+window.addEventListener('beforeunload', () => {
+  if (_fullDataReady) saveState();
+});
+
+$('restoreBtn').addEventListener('click', async () => {
+  if (!confirm('从服务器恢复数据将替换当前所有数据，确定继续？')) return;
+  if (state.running) { clearInterval(state.timerId); state.running = false; mainBtn.textContent = '开始'; }
+  try {
+    const res = await fetch('/api/load');
+    if (!res.ok) throw new Error('Failed');
+    const saved = await res.json();
+    taskList.innerHTML = '';
+    state.currentTaskIndex = -1;
+    _fullData = saved;
+    _fullDataReady = true;
+    applyLoadedState(saved, false);
+    state.timeLeft = getDurations()[state.mode];
+    updateDisplay();
+    document.title = `🍅 ${formatTime(state.timeLeft)} - ${MODES[state.mode].label}`;
+    // localStorage 只保留 30 天窗口
+    const localCopy = JSON.parse(JSON.stringify(saved));
+    const cutoff = Date.now() - SESSION_RETENTION_MS;
+    (localCopy.tasks || []).forEach(t => {
+      t.sessions = (t.sessions || []).filter(s => s.timestamp >= cutoff);
+    });
+    localStorage.setItem('pomodoro-state', JSON.stringify(localCopy));
+    showNotification('已从服务器恢复数据');
+  } catch(e) {
+    showNotification('从服务器恢复失败，请检查服务端是否运行');
+  }
+});
 
 function addTask() {
   const text = taskInput.value.trim();
@@ -633,6 +733,7 @@ taskInput.addEventListener('keydown', e => { if (e.key === 'Enter') addTask(); }
       document.title = `🍅 ${formatTime(state.timeLeft)} - ${MODES[state.mode].label}`;
     }
   });
+  inp.addEventListener('wheel', e => e.preventDefault(), { passive: true });
 });
 
 loadState();
@@ -662,12 +763,15 @@ const prevIncompleteList = document.getElementById('prevIncompleteList');
 
 let weeklyData = null;
 
-function openWeeklyPanel() {
+async function openWeeklyPanel() {
   weeklyPanel.classList.add('open');
   weeklyOverlay.classList.add('open');
   document.body.style.overflow = 'hidden';
-  if (!weeklyData) fetchWeeklySummary();
-  fetchWeeklyAnalysis();
+  renderClientWeeklyReport();
+  await fetchWeeklyAnalysis();
+  if ($('catCards') && !$('catCards').children.length) {
+    renderLocalWeeklyAnalysis();
+  }
 }
 
 function closeWeeklyPanel() {
@@ -693,7 +797,9 @@ function renderTaskRow(task, maxMinutes) {
   const div = document.createElement('div');
   div.className = 'chart-bar';
   const pct = maxMinutes > 0 ? (task.totalMinutes / maxMinutes) * 100 : 0;
-  const color = BAR_COLORS[Math.floor(Math.random() * BAR_COLORS.length)];
+  let hash = 0;
+  for (let i = 0; i < task.text.length; i++) hash = ((hash << 5) - hash) + task.text.charCodeAt(i);
+  const color = BAR_COLORS[Math.abs(hash) % BAR_COLORS.length];
   const catLabel = CAT_LABELS[task.category];
   const catColor = CAT_COLORS[task.category] || '#555';
   const catHtml = catLabel ? `<span class="cat-tag" style="background:${catColor}">${catLabel}</span>` : '';
@@ -744,6 +850,86 @@ async function fetchWeeklySummary() {
   } catch(e) { /* 静默降级 */ }
 }
 
+function getWeekRange(ts) {
+  const d = new Date(ts);
+  const day = d.getDay();
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(d.setDate(diff));
+  monday.setHours(0, 0, 0, 0);
+  const sunday = new Date(+monday);
+  sunday.setDate(monday.getDate() + 6);
+  sunday.setHours(23, 59, 59, 999);
+  const fmt = d => `${d.getMonth()+1}/${d.getDate()}`;
+  return { start: monday.getTime(), end: sunday.getTime(), label: `${fmt(monday)} - ${fmt(sunday)}` };
+}
+
+function generateClientWeeklyReport() {
+  const now = Date.now();
+  const thisWeek = getWeekRange(now);
+  const prevWeek = getWeekRange(thisWeek.start - 86400000);
+  const tasks = collectTasks();
+  const cwCompleted = [], cwIncomplete = [];
+  const pwCompleted = [], pwIncomplete = [];
+  let cwTotal = 0, pwTotal = 0;
+
+  tasks.forEach(task => {
+    const sessions = task.sessions || [];
+    let cwMin = 0, cwSess = 0, pwMin = 0, pwSess = 0;
+
+    sessions.forEach(s => {
+      const ts = s.timestamp || 0;
+      const dur = (s.duration || 1500) / 60;
+      if (ts >= thisWeek.start && ts < thisWeek.end) {
+        cwMin += dur; cwSess++;
+      } else if (ts >= prevWeek.start && ts < prevWeek.end) {
+        pwMin += dur; pwSess++;
+      }
+    });
+
+    const entry = (min, sess) => ({
+      text: task.text,
+      totalMinutes: Math.round(min),
+      sessionCount: sess,
+      category: task.category || 'uncategorized',
+      createdAt: task.createdAt,
+    });
+
+    if (cwMin > 0) {
+      cwTotal += cwMin;
+      const e = entry(cwMin, cwSess);
+      if (task.done) cwCompleted.push(e); else cwIncomplete.push(e);
+    }
+    if (pwMin > 0) {
+      pwTotal += pwMin;
+      const e = entry(pwMin, pwSess);
+      if (task.done) pwCompleted.push(e); else pwIncomplete.push(e);
+    }
+  });
+
+  return {
+    currentWeek: { weekRange: thisWeek.label, totalMinutes: Math.round(cwTotal), completedTasks: cwCompleted, incompleteTasks: cwIncomplete },
+    previousWeek: { weekRange: prevWeek.label, totalMinutes: Math.round(pwTotal), completedTasks: pwCompleted, incompleteTasks: pwIncomplete },
+  };
+}
+
+function renderClientWeeklyReport() {
+  const data = generateClientWeeklyReport();
+  weeklyData = data;
+  const { currentWeek, previousWeek } = data;
+  weekRange.textContent = currentWeek.weekRange;
+  weeklyTotalTime.textContent = formatMinutes(currentWeek.totalMinutes);
+  completedCountWeekly.textContent = currentWeek.completedTasks.length;
+  incompleteCountWeekly.textContent = currentWeek.incompleteTasks.length;
+  const curMax = Math.max(...currentWeek.completedTasks.map(t => t.totalMinutes), ...currentWeek.incompleteTasks.map(t => t.totalMinutes), 1);
+  renderTaskList(completedTasksList, currentWeek.completedTasks, '本周还没有完成的任务', curMax);
+  renderTaskList(incompleteTasksList, currentWeek.incompleteTasks, '本周没有待滚动任务', curMax);
+  prevCompletedCount.textContent = previousWeek.completedTasks.length;
+  prevIncompleteCount.textContent = previousWeek.incompleteTasks.length;
+  const prevMax = Math.max(...previousWeek.completedTasks.map(t => t.totalMinutes), ...previousWeek.incompleteTasks.map(t => t.totalMinutes), 1);
+  renderTaskList(prevCompletedList, previousWeek.completedTasks, '无', prevMax);
+  renderTaskList(prevIncompleteList, previousWeek.incompleteTasks, '无', prevMax);
+}
+
 const CAT_LABELS = { dev: '研发类', meeting: '会议类', doc: '办公材料类' };
 const CAT_COLORS = { dev: '#3498db', meeting: '#f39c12', doc: '#2ecc71', uncategorized: '#888' };
 
@@ -773,8 +959,44 @@ async function fetchWeeklyAnalysis() {
   } catch(e) {}
 }
 
+function renderLocalWeeklyAnalysis() {
+  const data = weeklyData;
+  if (!data) return;
+  const { currentWeek } = data;
+  const allTasks = [...currentWeek.completedTasks, ...currentWeek.incompleteTasks];
+  const catMap = {};
+  let totalMin = 0;
+  allTasks.forEach(t => {
+    const key = t.category || 'uncategorized';
+    if (!catMap[key]) catMap[key] = { totalMinutes: 0, count: 0 };
+    catMap[key].totalMinutes += t.totalMinutes;
+    catMap[key].count++;
+    totalMin += t.totalMinutes;
+  });
+  const cards = $('catCards');
+  const text = $('summaryText');
+  if (!cards) return;
+  cards.innerHTML = '';
+  const sorted = Object.entries(catMap).sort((a, b) => b[1].totalMinutes - a[1].totalMinutes);
+  const maxMin = Math.max(...sorted.map(([,c]) => c.totalMinutes), 1);
+  const lines = [];
+  sorted.forEach(([key, cat]) => {
+    const label = CAT_LABELS[key] || key;
+    const card = document.createElement('div');
+    card.className = 'cat-card' + (cat.totalMinutes === maxMin ? ' cat-top' : '');
+    const pct = totalMin > 0 ? Math.round(cat.totalMinutes / totalMin * 100) : 0;
+    card.innerHTML = `
+      <div class="cat-value">${formatMinutes(cat.totalMinutes)}</div>
+      <div class="cat-label">${label}</div>
+      <div class="cat-pct">${pct}% · ${cat.count}个任务</div>`;
+    cards.appendChild(card);
+    lines.push(`${label} ${formatMinutes(cat.totalMinutes)}（${pct}%）`);
+  });
+  text.textContent = lines.length > 0 ? `本周专注分布：${lines.join('，')}。` : '本周暂无专注记录。';
+}
+
 function addCategoryPicker(div, task) {
-  if (task.category !== 'uncategorized') return;
+  if (task.category && task.category !== 'uncategorized') return;
   const picker = document.createElement('span');
   picker.className = 'cat-picker';
   picker.innerHTML = Object.entries(CAT_LABELS).map(([k, v]) =>
@@ -784,25 +1006,33 @@ function addCategoryPicker(div, task) {
     const btn = e.target;
     if (btn.tagName !== 'BUTTON') return;
     const cat = btn.dataset.cat;
+    // 立即更新 UI
+    btn.textContent = '✓ ' + CAT_LABELS[cat];
+    btn.style.background = '#2ecc71';
+    btn.style.color = '#fff';
+    picker.querySelectorAll('button').forEach(b => { if (b !== btn) b.remove(); });
+    // 找到对应主列表的 task-item（渲染时精准匹配一次，避免匹配到其他任务）
+    let targetLi = null;
+    document.querySelectorAll('.task-item').forEach(li => {
+      if (Number(li.dataset.createdAt) === task.createdAt) targetLi = li;
+    });
+    if (!targetLi && !task.createdAt) {
+      document.querySelectorAll('.task-item').forEach(li => {
+        if (li.querySelector('.label').textContent === task.text) targetLi = li;
+      });
+    }
+    if (!targetLi) return;
+    targetLi.dataset.category = cat;
+    saveState();
+    renderClientWeeklyReport();
+    renderLocalWeeklyAnalysis();
+    // 静默同步到服务端
     try {
-      const res = await fetch('/api/set-category', {
+      await fetch('/api/set-category', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ createdAt: task.createdAt, category: cat }),
       });
-      if (!res.ok) throw new Error('Failed');
-      btn.textContent = '✓ ' + CAT_LABELS[cat];
-      btn.style.background = '#2ecc71';
-      btn.style.color = '#fff';
-      picker.querySelectorAll('button').forEach(b => { if (b !== btn) b.remove(); });
-      // 同步到主任务列表 DOM
-      document.querySelectorAll('.task-item').forEach(li => {
-        if (Number(li.dataset.createdAt) === task.createdAt) {
-          li.dataset.category = cat;
-        }
-      });
-      // 刷新分析
-      fetchWeeklyAnalysis();
     } catch(e) {}
   });
   div.querySelector('.bar-label').after(picker);

@@ -4,70 +4,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A single-file Pomodoro timer application (`pomodoro.html`) with task management and session tracking. No build tools, no dependencies, no package manager — just open in a browser.
+A Pomodoro timer application with task management, session tracking, and a weekly report dashboard. The frontend is a single HTML file; the backend is a Node.js server (stdlib only) providing API endpoints and file-based persistence.
 
-## Running the App
+## Quick Start
 
-Open `pomodoro.html` in any modern browser directly. No dev server or build step needed.
+```bash
+node pomodoro.js     # Starts on port 3457, auto-opens browser
+```
+
+Or double-click `启动番茄钟.bat` (Windows). The app can also be opened as `pomodoro.html` directly in a browser (localStorage-only mode, some features degrade silently).
 
 ## Architecture
 
-**Single file** — `pomodoro.html` contains HTML, CSS, and JavaScript in one document (~475 lines). The app has no framework, no bundler, and no external dependencies.
+Two files: `pomodoro.html` (frontend, ~1058 lines) and `pomodoro.js` (Node.js server, ~297 lines). No dependencies, no build step, no package manager.
 
-### Structure
+### Frontend (pomodoro.html)
 
-- **HTML**: Semantic structure with a `.container` holding mode tabs, timer ring (SVG), controls, task input/list, and stats display.
-- **CSS**: Dark theme with custom properties, flexbox layout, SVG circle progress ring. All styles are inline in `<style>`.
-- **JavaScript**: Vanilla JS in a single `<script>` block using an IIFE-less global scope pattern.
+Vanilla JS, no framework. All HTML/CSS/JS in one file with an IIFE-less global scope pattern.
 
-### State Management
+**Core modules:**
+- **Timer**: `setInterval`-based countdown with SVG `stroke-dashoffset` progress ring. Three modes (pomodoro/shortBreak/longBreak) with configurable durations.
+- **Task management**: Add/delete/complete tasks. Clicking a task selects it and auto-starts the timer. Tasks have session history tracked per-item in `data-sessions`.
+- **Weekly report**: Fixed sidebar opens a left panel with bar charts. Client-side computation (`generateClientWeeklyReport`) when server is unavailable.
+- **Task categorization**: Three categories (dev/meeting/doc) set via the weekly report UI. Local computation fallback (`renderLocalWeeklyAnalysis`) if server analysis endpoint is down.
 
-A `state` object holds all runtime state:
-```js
-{
-  mode: 'pomodoro' | 'shortBreak' | 'longBreak',
-  timeLeft: number (seconds),
-  running: boolean,
-  timerId: interval ID,
-  completed: number (total pomodoros),
-  sessionInRound: number (pomodoros since last long break),
-  currentTaskIndex: number (-1 = no task selected),
-}
-```
+**Key patterns:**
+- **Dual persistence with tiered retention**: `saveState()` saves 30-day filtered session data to `localStorage` (instant DOM read). When full server data (`_fullData`) is loaded asynchronously, it merges current DOM sessions into full history via `mergeIntoFullData()` and POSTs to server. `_fullDataReady` flag prevents writes before full data loads, avoiding overwriting history with the 30-day window.
+- **Silent degradation**: All `fetch()` calls to the server use `.catch(() => {})` — no user-facing errors for server unavailability.
+- **DOM as source of truth**: Task data (sessions, category, timestamps) is stored in `data-*` attributes. `collectTasks()` reads from DOM to serialize state.
+- **State object** (`state`): Holds mode, timeLeft, sessionDuration, running, completed counts, and `currentTaskIndex`. Not the single source of truth for task data (DOM is). `sessionDuration` is captured at toggle start so `recordSession()` records the actual mode duration, not hardcoded pomodoro length.
+- **30-day session window**: Only sessions within the last 30 days are kept in DOM/localStorage for daily performance. Full history is preserved on the server for annual analysis. `mergeIntoFullData()` matches tasks by `createdAt`, deduplicates sessions by `timestamp`, and prunes incomplete tasks not in the current DOM.
 
-Persistence via `localStorage` key `pomodoro-state` — saves completed count, session count, current task index, and full task list (text, done status, session history). Task session history is stored per-task in `data-sessions` as a JSON array of `{timestamp, duration}` objects.
+### Backend (pomodoro.js)
 
-### Key Functions
+Node.js stdlib HTTP server (no Express, no npm). Serves static files and provides REST API endpoints.
 
-| Function | Purpose |
-|---|---|
-| `switchMode(mode)` | Switches between pomodoro/shortBreak/longBreak, resets timer |
-| `toggleTimer()` | Start/pause the countdown interval |
-| `tick()` | Decrements `timeLeft` each second, triggers completion at 0 |
-| `completePomodoro()` | Records a completed pomodoro, auto-switches to break |
-| `resetTimer()` | Resets timeLeft to current mode's duration |
-| `getDurations()` | Reads the `<input>` values for all three modes in seconds |
-| `saveState()` / `loadState()` | Serialize/deserialize state + tasks to localStorage |
-| `createTaskElement(text, done, sessions)` | Creates a `<li>` with checkbox, label, session badge, delete button |
-| `recordSession()` | Attaches current pomodoro session data to the selected task |
-| `updateDisplay()` | Syncs all UI elements (timer text, ring progress, phase label, mode tabs) |
+- **Port strategy**: Starts at 3457, increments on conflict, up to 10 attempts.
+- **Persistence**: Reads/writes `pomodoro-data.json` in the project root.
+- **Auto-classification**: Keyword-based classifier in `CLASSIFY_RULES` for dev/meeting/doc categories. Used by `/api/weekly-analysis` to generate category breakdowns and summary text.
 
-### Data Flow
+### API Endpoints
 
-1. Timer ticks → `tick()` decrements `state.timeLeft` → `updateDisplay()` refreshes UI
-2. Pomodoro completes → `completePomodoro()` increments counters, calls `recordSession()` (attaches to active task), then auto-switches to break mode
-3. Tasks are clickable — clicking a task selects it (`state.currentTaskIndex`) and auto-starts the timer if not running
-4. All meaningful state changes call `saveState()` → `localStorage`
-5. On page load, `loadState()` restores persisted state
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/load` | Load all data from JSON file |
+| POST | `/api/save` | Save all data to JSON file |
+| POST | `/api/import` | Import data via form (bypasses CORS for file://) |
+| GET | `/api/weekly-summary` | Current + previous week task summary |
+| GET | `/api/weekly-analysis` | Category breakdown + auto-generated summary text |
+| POST | `/api/set-category` | Set category on a specific task (matched by `createdAt`) |
 
-### CSS Architecture
+## Data Model
 
-- Dark theme with three colors: `#1a1a2e` (background), `#16213e` (container), `#0f3460` (elements), `#e94560` (accent/highlight)
-- SVG progress ring uses `stroke-dasharray`/`stroke-dashoffset` for animation
-- `.hidden` utility class toggles visibility of mode-specific settings inputs
-- `@keyframes slideDown` for notification entrance animation
+Tasks stored as JSON array in `pomodoro-data.json` and `localStorage` (key `pomodoro-state`). Each task:
+- `text` (string), `done` (boolean), `category` (dev|meeting|doc|null)
+- `sessions[]` — array of `{timestamp, duration}` objects for each completed pomodoro
+- `createdAt` (number) — epoch ms, used as unique identifier for category assignment
+- `completedAt` (number) — epoch ms when task was checked done
 
-### Notification System
+## Weekly Report Rendering Flow
 
-- Visual: Fixed-position `<div>` with slide-down animation, auto-hides after 4s
-- Audio: Web Audio API generates a 880Hz sine tone for 300ms on completion
+1. `openWeeklyPanel()` → calls `renderClientWeeklyReport()` (computes from `collectTasks()`) + `fetchWeeklyAnalysis()` (server, with local fallback)
+2. `renderTaskRow()` creates a bar chart row per task, calls `addCategoryPicker()` for uncategorized tasks
+3. Category selection → updates `li.dataset.category`, calls `saveState()` + `renderClientWeeklyReport()` + `renderLocalWeeklyAnalysis()`
