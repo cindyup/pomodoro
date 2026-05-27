@@ -489,11 +489,12 @@ function updateTotalFocusTime() {
   totalFocusTime.textContent = h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function createTaskElement(text, done, sessions, createdAt) {
+function createTaskElement(text, done, sessions, createdAt, category) {
   const li = document.createElement('li');
   li.className = 'task-item' + (done ? ' done' : '');
   li.dataset.sessions = JSON.stringify(sessions);
   if (createdAt) li.dataset.createdAt = createdAt;
+  if (category) li.dataset.category = category;
   li.innerHTML = `
     <input type="checkbox"${done ? ' checked' : ''}>
     <span class="label">${text.replace(/</g,'&lt;')}</span>
@@ -539,6 +540,7 @@ function collectTasks() {
       sessions: JSON.parse(li.dataset.sessions || '[]'),
       createdAt: li.dataset.createdAt ? Number(li.dataset.createdAt) : null,
       completedAt: li.dataset.completedAt ? Number(li.dataset.completedAt) : null,
+      category: li.dataset.category || null,
     });
   });
   return tasks;
@@ -571,7 +573,7 @@ function applyLoadedState(saved) {
   sessionCount.textContent = state.sessionInRound;
   (saved.tasks || []).forEach(t => {
     const sessions = t.sessions || [];
-    const li = createTaskElement(t.text, t.done, sessions, t.createdAt || Date.now());
+    const li = createTaskElement(t.text, t.done, sessions, t.createdAt || Date.now(), t.category);
     if (t.completedAt) li.dataset.completedAt = t.completedAt;
     taskList.appendChild(li);
   });
@@ -793,6 +795,12 @@ function addCategoryPicker(div, task) {
       btn.style.background = '#2ecc71';
       btn.style.color = '#fff';
       picker.querySelectorAll('button').forEach(b => { if (b !== btn) b.remove(); });
+      // 同步到主任务列表 DOM
+      document.querySelectorAll('.task-item').forEach(li => {
+        if (Number(li.dataset.createdAt) === task.createdAt) {
+          li.dataset.category = cat;
+        }
+      });
       // 刷新分析
       fetchWeeklyAnalysis();
     } catch(e) {}
