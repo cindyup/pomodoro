@@ -7,7 +7,7 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-family: Consolas, monospace;
     display: flex; justify-content: center; align-items: center;
     min-height: 100vh; background: #1a1a2e; color: #eee;
   }
@@ -452,8 +452,13 @@ function renderTaskBadge(li) {
   if (sessions.length > 0) {
     const totalMin = sessions.reduce((sum, s) => sum + (s.duration || 1500), 0) / 60;
     badge.textContent = `${sessions.length}个🍅 ${Math.round(totalMin)}分`;
+    badge.style.cursor = ''; badge.style.color = '';
+  } else if (li.classList.contains('done')) {
+    badge.textContent = '+记录';
+    badge.style.cursor = 'pointer'; badge.style.color = '#f39c12';
   } else {
     badge.textContent = '';
+    badge.style.cursor = ''; badge.style.color = '';
   }
 }
 
@@ -1045,6 +1050,23 @@ $('showDoneToggle').addEventListener('click', () => {
     : `已完成 (${document.querySelectorAll('.task-item.done').length})`;
 });
 
+taskList.addEventListener('click', e => {
+  const badge = e.target.closest('.session-badge');
+  if (!badge) return;
+  const li = badge.closest('.task-item');
+  if (!li || !li.classList.contains('done')) return;
+  const sessions = JSON.parse(li.dataset.sessions || '[]');
+  if (sessions.length > 0) return;
+  e.stopPropagation();
+  const min = prompt('请输入专注分钟数：', '25');
+  if (!min || isNaN(min) || Number(min) <= 0) return;
+  sessions.push({ timestamp: Date.now(), duration: Number(min) * 60 });
+  li.dataset.sessions = JSON.stringify(sessions);
+  renderTaskBadge(li);
+  updateTotalFocusTime();
+  saveState();
+});
+
 archiveToggle.addEventListener('click', () => {
   archiveContent.classList.toggle('open');
   archiveToggle.textContent = archiveContent.classList.contains('open')
@@ -1056,6 +1078,16 @@ archiveToggle.addEventListener('click', () => {
 if (new Date().getDay() === 5) {
   setTimeout(openWeeklyPanel, 600);
 }
+
+// 心跳：每5秒通知服务端浏览器还开着，20秒无心跳服务端自动退出
+setInterval(() => {
+  fetch('/api/heartbeat').catch(() => {});
+}, 5000);
+
+// 关闭页面时立即通知服务端停止
+window.addEventListener('beforeunload', () => {
+  fetch('/api/shutdown', { method: 'POST', keepalive: true }).catch(() => {});
+});
 </script>
 </body>
 </html>
